@@ -1,13 +1,42 @@
-import * as crypto from "crypto";
-import { generateKeyPairSync } from "crypto";
+import crypto, { generateKeyPairSync } from "crypto";
+import fs from "fs/promises";
 import { NodeSSH } from "node-ssh";
+import path from "path";
+import ignore from "ignore";
 
-type FSPromisesModule = typeof import("fs/promises");
-type PathModule = typeof import("path");
+import {
+  ImageType,
+  InstanceExecResponse,
+  InstanceGetOptions,
+  InstanceHttpService,
+  InstanceListOptions,
+  InstanceNetworking,
+  InstanceRefs,
+  InstanceSnapshotOptions,
+  InstanceStartOptions,
+  InstanceStatus,
+  InstanceStopOptions,
+  InstanceType,
+  MorphCloudClientOptions,
+  MorphCloudClientType,
+  ResourceSpec,
+  SnapshotCreateOptions,
+  SnapshotGetOptions,
+  SnapshotListOptions,
+  SnapshotRefs,
+  SnapshotStatus,
+  SnapshotType,
+  SyncOptions,
+} from "./types";
 
 const MORPH_BASE_URL = "https://cloud.morph.so/api";
 const MORPH_SSH_HOSTNAME = "ssh.cloud.morph.so";
 const MORPH_SSH_PORT = 22;
+
+const DEFAULT_IMAGE = "morphvm-minimal";
+const DEFAULT_VCPUS = 2;
+const DEFAULT_MEMORY = 1024;
+const DEFAULT_DISK_SIZE = 1024;
 
 const SSH_TEMP_KEYPAIR = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -21,137 +50,29 @@ const SSH_TEMP_KEYPAIR = generateKeyPairSync("rsa", {
   },
 });
 
-enum SnapshotStatus {
-  PENDING = "pending",
-  READY = "ready",
-  FAILED = "failed",
-  DELETING = "deleting",
-  DELETED = "deleted",
-}
-
-enum InstanceStatus {
-  PENDING = "pending",
-  READY = "ready",
-  PAUSED = "paused",
-  SAVING = "saving",
-  ERROR = "error",
-}
-
-interface ResourceSpec {
-  vcpus: number;
-  memory: number;
-  diskSize: number;
-}
-
-interface SnapshotRefs {
-  imageId: string;
-}
-
-interface InstanceHttpService {
-  name: string;
-  port: number;
-  url: string;
-}
-
-interface InstanceNetworking {
-  internalIp?: string;
-  httpServices: InstanceHttpService[];
-  auth_mode?: string;
-}
-
-interface InstanceRefs {
-  snapshotId: string;
-  imageId: string;
-}
-
-interface InstanceExecResponse {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-}
-
-interface MorphCloudClientOptions {
-  apiKey?: string;
-  baseUrl?: string;
-  verbose?: boolean;
-}
-
-interface ImageListOptions {}
-
-interface SnapshotListOptions {
-  digest?: string;
-  metadata?: Record<string, string>;
-}
-
-interface SnapshotCreateOptions {
-  imageId?: string;
-  vcpus?: number;
-  memory?: number;
-  diskSize?: number;
-  digest?: string;
-  metadata?: Record<string, string>;
-}
-
-interface SnapshotGetOptions {
-  snapshotId: string;
-}
-
-interface InstanceListOptions {
-  metadata?: Record<string, string>;
-}
-
-interface InstanceStartOptions {
-  snapshotId: string;
-  metadata?: Record<string, string>;
-  ttlSeconds?: number;
-  ttlAction?: "stop" | "pause";
-}
-
-interface InstanceSnapshotOptions {
-  digest?: string;
-  metadata?: Record<string, string>;
-}
-
-interface InstanceGetOptions {
-  instanceId: string;
-}
-
-interface InstanceStopOptions {
-  instanceId: string;
-}
-
-interface SyncOptions {
-  delete?: boolean;
-  dryRun?: boolean;
-  verbose?: boolean;
-  respectGitignore?: boolean;
-}
-
 interface SFTPError extends Error {
   code?: string | number;
 }
 
-class Image {
+class Image implements ImageType {
   readonly id: string;
   readonly object: "image";
   readonly name: string;
   readonly description?: string;
   readonly diskSize: number;
   readonly created: number;
-  private client: MorphCloudClient;
 
-  constructor(data: any, client: MorphCloudClient) {
+  constructor(data: any) {
     this.id = data.id;
     this.object = data.object;
     this.name = data.name;
     this.description = data.description;
     this.diskSize = data.disk_size;
     this.created = data.created;
-    this.client = client;
   }
 }
 
-class Snapshot {
+class Snapshot implements SnapshotType {
   readonly id: string;
   readonly object: "snapshot";
   readonly created: number;
@@ -166,7 +87,7 @@ class Snapshot {
     this.id = data.id;
     this.object = data.object;
     this.created = data.created;
-    this.status = data.status;
+    this.status = data.status as SnapshotStatus;
     this.spec = {
       vcpus: data.spec.vcpus,
       memory: data.spec.memory,
@@ -215,25 +136,23 @@ class Snapshot {
    * Runs a command on an instance and streams the output
    * @param instance The instance to run the command on
    * @param command The command to run
-   * @param background Whether to run in the background
    * @param getPty Whether to allocate a PTY
    */
   private async _runCommandEffect(
-    instance: Instance,
+    instance: InstanceType,
     command: string,
-    background: boolean = false,
     getPty: boolean = true
   ): Promise<void> {
     const ssh = await instance.ssh();
 
     try {
       // Execute the command and capture output
-      const { stdout, stderr, code } = await ssh.execCommand(command, {
+      const { code } = await ssh.execCommand(command, {
         cwd: "/",
-        onStdout: (chunk) => {
+        onStdout: (chunk: Buffer) => {
           process.stdout.write(chunk.toString("utf8"));
         },
-        onStderr: (chunk) => {
+        onStderr: (chunk: Buffer) => {
           process.stderr.write(chunk.toString("utf8"));
         },
         // Set up PTY if requested
@@ -266,10 +185,9 @@ class Snapshot {
    * @returns A new (or cached) Snapshot with the updated chain hash
    */
   private async _cacheEffect<T extends any[]>(
-    fn: (instance: Instance, ...args: T) => Promise<void>,
+    fn: (instance: InstanceType, ...args: T) => Promise<void>,
     ...args: T
-  ): Promise<Snapshot> {
-    const metadata = this.metadata || {};
+  ): Promise<SnapshotType> {
     const parentChainHash = this.digest || this.id;
     const effectIdentifier = fn.name + JSON.stringify(args);
 
@@ -289,16 +207,15 @@ class Snapshot {
       return candidates[0];
     }
 
-    // 3) Otherwise, apply the effect on a fresh instance
     if (this.client.verbose) {
       console.log(`🚀 [RUN] ${args}`);
     }
-    const instance = await this.client.instances.start({ snapshotId: this.id });
+    const instance = await this.client.instances.start({ snapshotId: this.id }); // Ensure start returns InstanceType
 
     try {
       await instance.waitUntilReady(300);
       await fn(instance, ...args);
-      const newSnapshot = await instance.snapshot({ digest: newChainHash });
+      const newSnapshot = await instance.snapshot({ digest: newChainHash }); // Ensure snapshot returns SnapshotType
 
       return newSnapshot;
     } finally {
@@ -314,13 +231,12 @@ class Snapshot {
    * @param command The shell command to run
    * @returns A new snapshot with the command applied
    */
-  async setup(command: string): Promise<Snapshot> {
+  async setup(command: string): Promise<SnapshotType> {
     return this._cacheEffect(
-      async (instance: Instance, cmd: string, bg: boolean, pty: boolean) => {
-        await this._runCommandEffect(instance, cmd, bg, pty);
+      async (instance: InstanceType, cmd: string, pty: boolean) => {
+        await this._runCommandEffect(instance, cmd, pty);
       },
       command,
-      false,
       true
     );
   }
@@ -346,7 +262,7 @@ class Snapshot {
   }
 }
 
-class Instance {
+class Instance implements InstanceType {
   readonly id: string;
   readonly object: "instance";
   readonly created: number;
@@ -361,7 +277,7 @@ class Instance {
     this.id = data.id;
     this.object = data.object;
     this.created = data.created;
-    this.status = data.status;
+    this.status = data.status as InstanceStatus;
     this.spec = {
       vcpus: data.spec.vcpus,
       memory: data.spec.memory,
@@ -373,7 +289,7 @@ class Instance {
     };
     this.networking = {
       internalIp: data.networking.internal_ip,
-      httpServices: data.networking.http_services,
+      httpServices: data.networking.http_services as InstanceHttpService[],
     };
     this.metadata = data.metadata;
     this.client = client;
@@ -398,7 +314,7 @@ class Instance {
     await this.refresh();
   }
 
-  async snapshot(options: InstanceSnapshotOptions = {}): Promise<Snapshot> {
+  async snapshot(options: InstanceSnapshotOptions = {}): Promise<SnapshotType> {
     const digest = options.digest || undefined;
     const metadata = options.metadata || {};
 
@@ -412,8 +328,8 @@ class Instance {
   }
 
   async branch(count: number): Promise<{
-    snapshot: Snapshot;
-    instances: Instance[];
+    snapshot: SnapshotType;
+    instances: InstanceType[];
   }> {
     const response = await this.client.POST(
       `/instance/${this.id}/branch`,
@@ -451,7 +367,6 @@ class Instance {
 
   async hideHttpService(name: string): Promise<void> {
     await this.client.DELETE(`/instance/${this.id}/http/${name}`);
-
     await this.refresh();
   }
 
@@ -462,18 +377,20 @@ class Instance {
       {},
       { command: cmd }
     );
-    return response;
+    return response as InstanceExecResponse; // Cast if necessary
   }
 
   async waitUntilReady(timeout?: number): Promise<void> {
     const startTime = Date.now();
     while (this.status !== InstanceStatus.READY) {
+      // Use imported enum
       if (timeout && Date.now() - startTime > timeout * 1000) {
         throw new Error("Instance did not become ready before timeout");
       }
       await new Promise((resolve) => setTimeout(resolve, 1000));
       await this.refresh();
       if (this.status === InstanceStatus.ERROR) {
+        // Use imported enum
         throw new Error("Instance encountered an error");
       }
     }
@@ -496,10 +413,10 @@ class Instance {
     dest: string,
     options: SyncOptions = {}
   ): Promise<void> {
-    const ignore = require("ignore");
-
-    const fs = await import("fs/promises");
-    const path = await import("path");
+    interface FileInfo {
+      size: number;
+      mtime: number;
+    }
 
     const log = (level: "info" | "debug" | "error", message: string) => {
       if (options.verbose || level === "error") {
@@ -526,11 +443,6 @@ class Instance {
       const relativePath = path.relative(baseDir, filePath);
       return ignoreRule.ignores(relativePath);
     };
-
-    interface FileInfo {
-      size: number;
-      mtime: number;
-    }
 
     const parseInstancePath = (path: string): [string | null, string] => {
       const match = path.match(/^([^:]+):(.+)$/);
@@ -664,7 +576,7 @@ class Instance {
             }
           } catch (error) {
             const sftpError = error as SFTPError;
-            if (sftpError.code !== "ENOENT") {
+            if (sftpError.code !== "ENOENT" && sftpError.code !== 2) {
               throw error;
             }
           }
@@ -678,8 +590,6 @@ class Instance {
       const getLocalFiles = async (
         dir: string
       ): Promise<Map<string, FileInfo>> => {
-        const fs = (await import("fs/promises")) as FSPromisesModule;
-        const path = (await import("path")) as PathModule;
         const files = new Map<string, FileInfo>();
 
         const ignoreRule = options.respectGitignore
@@ -711,9 +621,9 @@ class Instance {
                 });
               }
             }
-          } catch (error) {
-            const sftpError = error as SFTPError;
-            if (sftpError.code !== "ENOENT") {
+          } catch (error: any) {
+            // Catch any error
+            if (error.code !== "ENOENT") {
               throw error;
             }
           }
@@ -735,30 +645,24 @@ class Instance {
             await promisifiedSftp.stat(current);
           } catch (error) {
             const sftpError = error as SFTPError;
-            const errorCode =
-              typeof sftpError.code === "string"
-                ? parseInt(sftpError.code)
-                : sftpError.code;
-
-            if (errorCode === 2) {
-              // ENOENT
+            // Check for ENOENT (file not found) - code might be string or number
+            if (sftpError.code === "ENOENT" || sftpError.code === 2) {
               try {
                 await promisifiedSftp.mkdir(current);
                 log("debug", `Created remote directory: ${current}`);
               } catch (mkdirError: unknown) {
                 const err = mkdirError as SFTPError;
-                const mkdirErrCode =
-                  typeof err.code === "string" ? parseInt(err.code) : err.code;
-
-                // Ignore if directory already exists or was created by another process
-                if (mkdirErrCode === 4) {
-                  // EEXIST
-                  log("debug", `Directory already exists: ${current}`);
-                } else {
-                  throw mkdirError;
+                // Check for EEXIST (file exists) - code might be string or number
+                if (err.code !== "EEXIST" && err.code !== 4) {
+                  throw mkdirError; // Re-throw if it's not an "already exists" error
                 }
+                log(
+                  "debug",
+                  `Directory already exists or created concurrently: ${current}`
+                );
               }
             } else {
+              // Re-throw other stat errors
               throw error;
             }
           }
@@ -766,9 +670,6 @@ class Instance {
       };
 
       const syncToRemote = async (localDir: string, remoteDir: string) => {
-        const fs = await import("fs/promises");
-        const path = await import("path");
-
         await mkdirRemote(remoteDir);
 
         log("info", "Scanning directories...");
@@ -791,7 +692,7 @@ class Instance {
           if (
             !remoteInfo ||
             remoteInfo.size !== localInfo.size ||
-            Math.abs(remoteInfo.mtime - localInfo.mtime) >= 1
+            Math.abs(remoteInfo.mtime - localInfo.mtime) >= 1 // Allow small diffs
           ) {
             changes.push({
               type: "copy",
@@ -851,7 +752,7 @@ class Instance {
           try {
             if (change.type === "copy") {
               const targetDir = path.dirname(change.dest);
-              log("info", `Ensuring directory exists: ${targetDir}`);
+              // No need to log 'Ensuring directory exists' as mkdirRemote handles it
               await mkdirRemote(targetDir);
 
               log("info", `Copying ${change.dest}`);
@@ -861,11 +762,12 @@ class Instance {
               const stat = await fs.stat(change.source!);
               await promisifiedSftp.utimes(
                 change.dest,
-                stat.mtimeMs / 1000,
-                stat.mtimeMs / 1000
+                stat.mtimeMs / 1000, // atime
+                stat.mtimeMs / 1000 // mtime
               );
             } else {
               log("info", `Deleting ${change.dest}`);
+              // Ignore errors during deletion (e.g., file already gone)
               await promisifiedSftp.unlink(change.dest).catch(() => {});
             }
           } catch (error) {
@@ -874,15 +776,14 @@ class Instance {
               "error",
               `Error processing ${change.dest}: ${sftpError.message} (code: ${sftpError.code})`
             );
+            // Decide whether to continue or re-throw
+            // For now, re-throw to stop the sync on error
             throw error;
           }
         }
       };
 
       const syncFromRemote = async (remoteDir: string, localDir: string) => {
-        const fs = await import("fs/promises");
-        const path = await import("path");
-
         await fs.mkdir(localDir, { recursive: true });
 
         log("info", "Scanning directories...");
@@ -905,7 +806,7 @@ class Instance {
           if (
             !localInfo ||
             localInfo.size !== remoteInfo.size ||
-            Math.abs(localInfo.mtime - remoteInfo.mtime) >= 1
+            Math.abs(localInfo.mtime - remoteInfo.mtime) >= 1 // Allow small diffs
           ) {
             changes.push({
               type: "copy",
@@ -967,19 +868,24 @@ class Instance {
               await fs.mkdir(path.dirname(change.dest), { recursive: true });
               await promisifiedSftp.fastGet(change.source!, change.dest);
 
+              // Get mtime from remote file *after* download
               const stat = await promisifiedSftp.stat(change.source!);
-              await fs.utimes(change.dest, stat.mtime, stat.mtime);
+              await fs.utimes(change.dest, stat.mtime, stat.mtime); // Use remote mtime for both atime/mtime
             } else {
               log("info", `Deleting ${change.dest}`);
               try {
                 await fs.unlink(change.dest);
-              } catch (error) {
-                // Ignore errors if file doesn't exist
+              } catch (error: any) {
+                // Ignore errors if file doesn't exist locally
+                if (error.code !== "ENOENT") {
+                  throw error;
+                }
               }
             }
           } catch (error) {
             const err = error as Error;
             log("error", `Error processing ${change.dest}: ${err.message}`);
+            // Decide whether to continue or re-throw
             throw error;
           }
         }
@@ -996,18 +902,26 @@ class Instance {
   }
 
   private async refresh(): Promise<void> {
-    const instance = await this.client.instances.get({ instanceId: this.id });
-    Object.assign(this, instance);
+    const instanceData: InstanceType = await this.client.instances.get({
+      instanceId: this.id,
+    });
+    Object.assign(this, instanceData);
   }
 }
 
-class MorphCloudClient {
+class MorphCloudClient implements MorphCloudClientType {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly verbose: boolean;
 
   constructor(options: MorphCloudClientOptions = {}) {
+    // Use imported type
     this.apiKey = options.apiKey || process.env.MORPH_API_KEY || "";
+    if (!this.apiKey) {
+      throw new Error(
+        "Morph API key is required. Provide it via options or MORPH_API_KEY environment variable."
+      );
+    }
     this.baseUrl = options.baseUrl || MORPH_BASE_URL;
     this.verbose = options.verbose || false;
   }
@@ -1017,151 +931,206 @@ class MorphCloudClient {
     endpoint: string,
     query?: any,
     data?: any
-  ) {
+  ): Promise<any> {
+    // Return type can be kept as any or made more specific if possible
     let uri = new URL(this.baseUrl + endpoint);
     if (query) {
-      uri.search = new URLSearchParams(query).toString();
+      // Filter out undefined/null query params
+      const filteredQuery = Object.entries(query)
+        .filter(([_, value]) => value !== undefined && value !== null)
+        .reduce(
+          (obj, [key, value]) => {
+            obj[key] = value;
+            return obj;
+          },
+          {} as Record<string, any>
+        );
+      uri.search = new URLSearchParams(filteredQuery).toString();
     }
-    const response = await fetch(uri, {
+
+    const headers: HeadersInit = {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Authorization: `Bearer ${this.apiKey}`,
+    };
+
+    const response = await fetch(uri.toString(), {
+      // Ensure uri is string
       method,
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
+      headers,
       body: data ? JSON.stringify(data) : undefined,
     });
 
     if (!response.ok) {
       let errorBody;
       try {
+        // Try to parse JSON error first
         errorBody = await response.json();
       } catch {
+        // Fallback to text if JSON parsing fails
         errorBody = await response.text();
       }
-      throw new Error(
-        `HTTP Error ${response.status} for url '${response.url}'\nResponse Body: ${JSON.stringify(errorBody, null, 2)}`
-      );
+      // Improve error message
+      const errorMessage = `HTTP Error ${response.status} (${response.statusText}) for ${method} ${response.url}`;
+      const errorDetails =
+        typeof errorBody === "string"
+          ? errorBody
+          : JSON.stringify(errorBody, null, 2);
+      throw new Error(`${errorMessage}\nResponse Body:\n${errorDetails}`);
     }
+
+    // Handle responses with no content (e.g., 204 No Content for DELETE)
+    if (
+      response.status === 204 ||
+      response.headers.get("content-length") === "0"
+    ) {
+      return {}; // Return an empty object or undefined as appropriate
+    }
+
     try {
+      // Assume successful responses are JSON
       return await response.json();
     } catch (error) {
-      return {};
+      // This catch block might be less likely now with the checks above, but keep for safety
+      throw new Error(
+        `Failed to parse JSON response for ${method} ${response.url}: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   }
 
-  async GET(endpoint: string, query?: any) {
+  async GET(endpoint: string, query?: any): Promise<any> {
     return this.request("GET", endpoint, query);
   }
 
-  async POST(endpoint: string, query?: any, data?: any) {
+  async POST(endpoint: string, query?: any, data?: any): Promise<any> {
     return this.request("POST", endpoint, query, data);
   }
 
-  async DELETE(endpoint: string, query?: any) {
-    await this.request("DELETE", endpoint, query);
+  async DELETE(endpoint: string, query?: any): Promise<void> {
+    // DELETE often returns no body
+    await this.request("DELETE", endpoint, query); // request handles 204 correctly now
   }
 
   images = {
-    list: async (options: ImageListOptions = {}): Promise<Image[]> => {
+    list: async (): Promise<ImageType[]> => {
+      // Return imported type array
       const response = await this.GET("/image");
-      return response.data.map((image: any) => new Image(image, this));
+      // Ensure the mapping creates objects conforming to ImageType
+      return response.data.map((image: any) => new Image(image));
     },
   };
 
   snapshots = {
-    list: async (options: SnapshotListOptions = {}): Promise<Snapshot[]> => {
+    list: async (
+      options: SnapshotListOptions = {}
+    ): Promise<SnapshotType[]> => {
+      // Return imported type array
       // safely build query string
       const { digest, metadata } = options;
-      const queryParams = new URLSearchParams();
+      const queryParams: Record<string, string> = {}; // Use Record for easier construction
 
       // Add digest if provided
       if (digest) {
-        queryParams.append("digest", digest);
+        queryParams["digest"] = digest;
       }
 
       // Add metadata in stripe style format: metadata[key]=value
       if (metadata) {
         Object.entries(metadata).forEach(([key, value]) => {
-          queryParams.append(`metadata[${key}]`, String(value));
+          queryParams[`metadata[${key}]`] = String(value); // Ensure value is string
         });
       }
 
-      // Build the final query string
-      const params = queryParams.toString() ? `?${queryParams.toString()}` : "";
-
-      const response = await this.GET(`/snapshot${params}`);
+      const response = await this.GET(`/snapshot`, queryParams); // Pass queryParams directly
+      // Ensure the mapping creates objects conforming to SnapshotType
       return response.data.map((snapshot: any) => new Snapshot(snapshot, this));
     },
 
-    create: async (options: SnapshotCreateOptions = {}): Promise<Snapshot> => {
-      // Convert Map to object if needed
-      let metadata = options.metadata;
-      if (metadata instanceof Map) {
-        metadata = Object.fromEntries(metadata.entries());
+    create: async (
+      options: SnapshotCreateOptions = {}
+    ): Promise<SnapshotType> => {
+      // Return imported type
+      // Convert Map to object if needed - ensure this happens *before* digest creation if metadata is used there
+      let requestMetadata = options.metadata;
+      if (requestMetadata instanceof Map) {
+        requestMetadata = Object.fromEntries(requestMetadata.entries());
       }
 
-      const create_digest = (options: SnapshotCreateOptions) => {
+      // Helper function for digest creation, using the potentially converted metadata
+      const create_digest = (
+        opts: SnapshotCreateOptions,
+        meta?: Record<string, string>
+      ) => {
         const hasher = crypto.createHash("sha256");
-        hasher.update(options.imageId || "");
-        hasher.update(String(options.vcpus));
-        hasher.update(String(options.memory));
-        hasher.update(String(options.diskSize));
+        hasher.update(opts.imageId || DEFAULT_IMAGE); // Provide a default if imageId is optional but needed for hash
+        hasher.update(String(opts.vcpus || DEFAULT_VCPUS)); // Provide defaults if optional
+        hasher.update(String(opts.memory || DEFAULT_MEMORY));
+        hasher.update(String(opts.diskSize || DEFAULT_DISK_SIZE));
         // Sort metadata keys to ensure consistent hash
-        if (metadata) {
-          Object.keys(metadata)
+        const currentMetadata = meta || {}; // Use the potentially converted metadata passed in
+        if (currentMetadata) {
+          Object.keys(currentMetadata)
             .sort()
             .forEach((key) => {
               hasher.update(key);
-              hasher.update(metadata[key]);
+              hasher.update(currentMetadata[key]); // Assumes metadata values are strings or consistently stringifiable
             });
         }
         return hasher.digest("hex");
       };
 
-      const digest = options.digest || create_digest(options);
+      // Pass the potentially converted metadata to create_digest
+      const digest = options.digest || create_digest(options, requestMetadata);
 
       const data = {
         image_id: options.imageId,
-        vcpus: options.vcpus,
-        memory: options.memory,
-        disk_size: options.diskSize,
-        digest: options.digest,
-        readiness_check: { type: "timeout", timeout: 10.0 },
-        metadata: metadata || {},
+        spec: {
+          // API might expect spec object
+          vcpus: options.vcpus,
+          memory: options.memory,
+          disk_size: options.diskSize,
+        },
+        digest: digest, // Use the calculated or provided digest
+        metadata: requestMetadata || {},
       };
       const response = await this.POST("/snapshot", {}, data);
+      // Ensure the constructor returns an object conforming to SnapshotType
       return new Snapshot(response, this);
     },
 
-    get: async (options: SnapshotGetOptions): Promise<Snapshot> => {
+    get: async (options: SnapshotGetOptions): Promise<SnapshotType> => {
+      // Return imported type
       const response = await this.GET(`/snapshot/${options.snapshotId}`);
+      // Ensure the constructor returns an object conforming to SnapshotType
       return new Snapshot(response, this);
     },
   };
 
   instances = {
-    list: async (options: InstanceListOptions = {}): Promise<Instance[]> => {
+    list: async (
+      options: InstanceListOptions = {}
+    ): Promise<InstanceType[]> => {
+      // Return imported type array
       const { metadata } = options;
-      const queryParams = new URLSearchParams();
+      const queryParams: Record<string, string> = {};
 
       // Add metadata in stripe style format: metadata[key]=value
       if (metadata && typeof metadata === "object") {
         Object.entries(metadata).forEach(([key, value]) => {
-          queryParams.append(`metadata[${key}]`, String(value));
+          queryParams[`metadata[${key}]`] = String(value);
         });
       }
 
-      // Build the final query string
-      const params = queryParams.toString() ? `?${queryParams.toString()}` : "";
-      const response = await this.GET(`/instance${params}`);
+      const response = await this.GET(`/instance`, queryParams);
+      // Ensure the mapping creates objects conforming to InstanceType
       return response.data.map((instance: any) => new Instance(instance, this));
     },
 
-    start: async (options: InstanceStartOptions): Promise<Instance> => {
+    start: async (options: InstanceStartOptions): Promise<InstanceType> => {
+      // Return imported type
       const { snapshotId, metadata, ttlSeconds, ttlAction } = options;
 
-      // Build query parameters
+      // Build query parameters (only snapshot_id goes here based on previous structure)
       const queryParams = {
         snapshot_id: snapshotId,
       };
@@ -1169,7 +1138,11 @@ class MorphCloudClient {
       // Build request body
       const body: any = {};
       if (metadata) {
-        body.metadata = metadata;
+        // Convert Map if necessary
+        body.metadata =
+          metadata instanceof Map
+            ? Object.fromEntries(metadata.entries())
+            : metadata;
       }
       if (ttlSeconds !== undefined) {
         body.ttl_seconds = ttlSeconds;
@@ -1179,11 +1152,14 @@ class MorphCloudClient {
       }
 
       const response = await this.POST("/instance", queryParams, body);
+      // Ensure the constructor returns an object conforming to InstanceType
       return new Instance(response, this);
     },
 
-    get: async (options: InstanceGetOptions): Promise<Instance> => {
+    get: async (options: InstanceGetOptions): Promise<InstanceType> => {
+      // Return imported type
       const response = await this.GET(`/instance/${options.instanceId}`);
+      // Ensure the constructor returns an object conforming to InstanceType
       return new Instance(response, this);
     },
 
@@ -1193,27 +1169,4 @@ class MorphCloudClient {
   };
 }
 
-export { MorphCloudClient };
-export { InstanceStatus, SnapshotStatus };
-export type {
-  MorphCloudClientOptions,
-  ResourceSpec,
-  SnapshotRefs,
-  InstanceHttpService,
-  InstanceNetworking,
-  InstanceRefs,
-  InstanceExecResponse,
-  Snapshot,
-  Instance,
-  Image,
-  SyncOptions,
-  SnapshotCreateOptions,
-  SnapshotGetOptions,
-  SnapshotListOptions,
-  ImageListOptions,
-  InstanceListOptions,
-  InstanceStartOptions,
-  InstanceSnapshotOptions,
-  InstanceGetOptions,
-  InstanceStopOptions,
-};
+export { Image, Instance, MorphCloudClient, Snapshot };
